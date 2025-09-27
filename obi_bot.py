@@ -2,64 +2,89 @@ import os
 import time
 import requests
 
-# Get settings from environment variables (Render dashboard)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Get Telegram details from environment variables (Render Env Vars)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-MODE = os.getenv("MODE", "price_diff")   # price_diff mode
-PRICE_DIFF = float(os.getenv("PRICE_DIFF", "1000"))
-INTERVAL_SEC = int(os.getenv("INTERVAL_SEC", "60"))
 
 # Binance API endpoint
-BINANCE_ORDERBOOK_URL = "https://api.binance.com/api/v3/depth"
+BINANCE_URL = "https://api.binance.com/api/v3/depth"
+SYMBOL = "BTCUSDT"
+LIMIT = 1000   # Max depth Binance allows
 
-def get_orderbook(symbol="BTCUSDT", limit=1000):
-    url = f"{BINANCE_ORDERBOOK_URL}?symbol={symbol}&limit=1000"
-    response = requests.get(url, timeout=10)
-    return response.json()
+def get_orderbook(symbol=SYMBOL, limit=LIMIT):
+    """Fetch order book data from Binance"""
+    try:
+        response = requests.get(BINANCE_URL, params={"symbol": symbol, "limit": limit}, timeout=10)
+        data = response.json()
+        return data
+    except Exception as e:
+        print(f"Error fetching orderbook: {e}")
+        return None
 
-def calculate_obi(orderbook, price_diff):
-    bids = [(float(p), float(q)) for p, q in orderbook["bids"]]
-    asks = [(float(p), float(q)) for p, q in orderbook["asks"]]
+def calculate_obi(data, price_range=15000):
+    """Calculate buy/sell imbalance in ± price_range around current price"""
+    if not data:
+        return None, None, None
 
-    # Current mid price
-    mid_price = (bids[0][0] + asks[0][0]) / 2
+    # Get current mid-price (average of best bid/ask)
+    best_bid = float(data["bids"][0][0])
+    best_ask = float(data["asks"][0][0])
+    mid_price = (best_bid + best_ask) / 2
 
-    # Price range
-    lower = mid_price - price_diff
-    upper = mid_price + price_diff
+    lower_bound = mid_price - price_range
+    upper_bound = mid_price + price_range
 
-    bid_vol = sum(q for p, q in bids if lower <= p <= mid_price)
-    ask_vol = sum(q for p, q in asks if mid_price <= p <= upper)
+    buy_volume = 0
+    sell_volume = 0
 
-    obi = (bid_vol - ask_vol) / (bid_vol + ask_vol) * 100 if (bid_vol + ask_vol) > 0 else 0
+    # Sum buy orders (bids)
+    for price, qty in data["bids"]:
+        price = float(price)
+        qty = float(qty)
+        if lower_bound <= price <= upper_bound:
+            buy_volume += price * qty
 
-    return mid_price, lower, upper, bid_vol, ask_vol, obi
+    # Sum sell orders (asks)
+    for price, qty in data["asks"]:
+        price = float(price)
+        qty = float(qty)
+        if lower_bound <= price <= upper_bound:
+            sell_volume += price * qty
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    requests.post(url, data=payload, timeout=10)
+    total = buy_volume + sell_volume
+    if total == 0:
+        return 0, 0, 0
+
+    buy_imbalance = (buy_volume / total) * 100
+    sell_imbalance = (sell_volume / total) * 100
+    net_obi = buy_imbalance - sell_imbalance
+
+    return round(buy_imbalance, 2), round(sell_imbalance, 2), round(net_obi, 2)
+
+def send_telegram_message(message):
+    """Send message to Telegram bot"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
 
 def main():
     while True:
-        try:
-            ob = get_orderbook(SYMBOL)
-            mid, lower, upper, bid, ask, obi = calculate_obi(ob, PRICE_DIFF)
+        data = get_orderbook()
+        buy_imbalance, sell_imbalance, net_obi = calculate_obi(data)
 
-            msg = (
-                f"📊 OBI {SYMBOL}\n"
-                f"Price: {mid:,.2f}\n"
-                f"Range: {lower:,.2f} → {upper:,.2f}\n"
-                f"BidVol: {bid:,.2f}\n"
-                f"AskVol: {ask:,.2f}\n"
-                f"OBI: {obi:.2f}%"
+        if buy_imbalance is not None:
+            message = (
+                f"📊 OBI Report (±15,000 USD)\n"
+                f"🟢 Buy Imbalance: {buy_imbalance}%\n"
+                f"🔴 Sell Imbalance: {sell_imbalance}%\n"
+                f"⚖️ Net OBI: {net_obi}%"
             )
-            send_telegram(msg)
-        except Exception as e:
-            send_telegram(f"⚠️ Error: {str(e)}")
+            send_telegram_message(message)
 
-        time.sleep(INTERVAL_SEC)
+        time.sleep(60)  # Wait 60 seconds
 
 if __name__ == "__main__":
     main()
