@@ -15,7 +15,7 @@ def fetch_order_book(symbol="ETHUSDT", limit=5000):
     data = response.json()
     return data["bids"], data["asks"]
 
-def calculate_bins(bids, asks, bin_size=50, price_range=500):
+def calculate_bins(bids, asks, bin_size=100, price_range=500):
     """Calculate OBI using bins within ±price_range"""
     best_bid = float(bids[0][0])
     best_ask = float(asks[0][0])
@@ -32,14 +32,14 @@ def calculate_bins(bids, asks, bin_size=50, price_range=500):
     # Fill buy bins (bids)
     for price, qty in bids:
         p, q = float(price), float(qty)
-        if p >= lower_bound and p <= upper_bound:
+        if lower_bound <= p <= upper_bound:
             bin_index = int((p - lower_bound) / bin_size)
             buy_bins[bin_index] += p * q  # in USDT
 
     # Fill sell bins (asks)
     for price, qty in asks:
         p, q = float(price), float(qty)
-        if p >= lower_bound and p <= upper_bound:
+        if lower_bound <= p <= upper_bound:
             bin_index = int((p - lower_bound) / bin_size)
             sell_bins[bin_index] += p * q  # in USDT
 
@@ -68,7 +68,7 @@ def main():
             mid, low, high, buy_vol, sell_vol, obi = calculate_bins(bids, asks)
 
             message = (
-                f"📊 ETH OBI Report (±500 range, $50 bins)\n"
+                f"📊 ETH OBI Report (±500 range, $100 bins)\n"
                 f"💰 Mid Price: {mid:.2f}\n"
                 f"📉 Range: {low:.2f} → {high:.2f}\n"
                 f"🟢 Buy Volume: {buy_vol:,.2f} USDT\n"
