@@ -2,64 +2,52 @@ import os
 import time
 import requests
 
-# Get Telegram details from environment variables (Render Env Vars)
+# Get Telegram details from environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # Binance API endpoint
 BINANCE_URL = "https://api.binance.com/api/v3/depth"
-SYMBOL = "BTCUSDT"
-LIMIT = 1000   # Max depth Binance allows
+SYMBOL = "ETHUSDT"
+LIMIT = 1000   # fetch up to 1000 levels
 
 def get_orderbook(symbol=SYMBOL, limit=LIMIT):
     """Fetch order book data from Binance"""
     try:
         response = requests.get(BINANCE_URL, params={"symbol": symbol, "limit": limit}, timeout=10)
-        data = response.json()
-        return data
+        return response.json()
     except Exception as e:
         print(f"Error fetching orderbook: {e}")
         return None
 
-def calculate_obi(data, price_range=15000):
-    """Calculate buy/sell imbalance in ± price_range around current price"""
+def calculate_obi(data, price_range=500):
+    """Calculate OBI within ±price_range around mid price"""
     if not data:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
-    # Get current mid-price (average of best bid/ask)
-    best_bid = float(data["bids"][0][0])
-    best_ask = float(data["asks"][0][0])
+    bids = [(float(p), float(q)) for p, q in data["bids"]]
+    asks = [(float(p), float(q)) for p, q in data["asks"]]
+
+    # Mid price = average of best bid & ask
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
     mid_price = (best_bid + best_ask) / 2
 
     lower_bound = mid_price - price_range
     upper_bound = mid_price + price_range
 
-    buy_volume = 0
-    sell_volume = 0
-
-    # Sum buy orders (bids)
-    for price, qty in data["bids"]:
-        price = float(price)
-        qty = float(qty)
-        if lower_bound <= price <= upper_bound:
-            buy_volume += price * qty
-
-    # Sum sell orders (asks)
-    for price, qty in data["asks"]:
-        price = float(price)
-        qty = float(qty)
-        if lower_bound <= price <= upper_bound:
-            sell_volume += price * qty
-
+    buy_volume = sum(p * q for p, q in bids if lower_bound <= p <= upper_bound)
+    sell_volume = sum(p * q for p, q in asks if lower_bound <= p <= upper_bound)
     total = buy_volume + sell_volume
+
     if total == 0:
-        return buy_volume, sell_volume, 0, 0, 0
+        return buy_volume, sell_volume, 0, 0, 0, mid_price, (lower_bound, upper_bound)
 
-    buy_imbalance = (buy_volume / total) * 100
-    sell_imbalance = (sell_volume / total) * 100
-    net_obi = buy_imbalance - sell_imbalance
+    buy_pct = (buy_volume / total) * 100
+    sell_pct = (sell_volume / total) * 100
+    net_obi = buy_pct - sell_pct
 
-    return round(buy_volume, 2), round(sell_volume, 2), round(buy_imbalance, 2), round(sell_imbalance, 2), round(net_obi, 2)
+    return round(buy_volume, 2), round(sell_volume, 2), round(buy_pct, 2), round(sell_pct, 2), round(net_obi, 2), round(mid_price, 2), (round(lower_bound, 2), round(upper_bound, 2))
 
 def send_telegram_message(message):
     """Send message to Telegram bot"""
@@ -73,11 +61,13 @@ def send_telegram_message(message):
 def main():
     while True:
         data = get_orderbook()
-        buy_vol, sell_vol, buy_pct, sell_pct, net_obi = calculate_obi(data)
+        buy_vol, sell_vol, buy_pct, sell_pct, net_obi, mid_price, (lower, upper) = calculate_obi(data)
 
         if buy_vol is not None:
             message = (
-                f"📊 OBI Report (±15,000 USD)\n"
+                f"📊 ETH OBI Report (±500 range)\n"
+                f"💰 Mid Price: {mid_price}\n"
+                f"📉 Range: {lower} → {upper}\n\n"
                 f"🟢 Buy Volume: {buy_vol:,.2f} USDT ({buy_pct}%)\n"
                 f"🔴 Sell Volume: {sell_vol:,.2f} USDT ({sell_pct}%)\n"
                 f"⚖️ Net OBI: {net_obi}%"
