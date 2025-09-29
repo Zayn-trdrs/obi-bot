@@ -1,119 +1,114 @@
+import asyncio
+import aiohttp
 import numpy as np
 import pandas as pd
-import requests
-from datetime import datetime
 import talib
 
 # ===============================
-# CONFIGURATION
+# CONFIG
 # ===============================
-API_KEY = "YOUR_EXCHANGE_API_KEY"
-API_SECRET = "YOUR_EXCHANGE_SECRET"
+SYMBOL = "BTCUSDT"
+POSITION_RISK = 0.02
+ATR_PERIOD = 14
+OBI_LEVELS = 10
+TMS_THRESHOLD = 0.02
+Z_THRESHOLD = 1.5
+EXHAUSTION_Z = 2
 TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
-
-SYMBOL = "BTCUSDT"
-POSITION_RISK = 0.02  # 2% of capital per trade
-ATR_PERIOD = 14
-OBI_LEVELS = 10  # Top N levels of order book
-TMS_THRESHOLD = 0.02  # Trend Momentum Score threshold
-Z_THRESHOLD = 1.5  # Weighted OBI z-score
-EXHAUSTION_Z = 2  # CVD exhaustion z-score
-
-# ===============================
-# FUNCTIONS
-# ===============================
-
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": message})
-
-def get_order_book(symbol, limit=OBI_LEVELS):
-    # Replace with your exchange API endpoint
-    url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}"
-    data = requests.get(url).json()
-    bids = np.array([[float(price), float(qty)] for price, qty in data['bids']])
-    asks = np.array([[float(price), float(qty)] for price, qty in data['asks']])
-    return bids, asks
-
-def calculate_weighted_obi(bids, asks):
-    # Weighted OBI formula
-    w = 1 / (np.arange(1, len(bids)+1))
-    WOBI = np.sum((bids[:,1] - asks[:,1]) * w) / np.sum(w)
-    return WOBI
-
-def calculate_z_score(series):
-    return (series[-1] - np.mean(series)) / np.std(series)
-
-def get_historical_klines(symbol, interval="1m", limit=100):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url).json()
-    df = pd.DataFrame(data, columns=[
-        "open_time","open","high","low","close","volume","close_time",
-        "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
-    ])
-    df = df.astype(float)
-    return df
-
-def calculate_tms(df):
-    # Trend Momentum Score: weighted sum of price, volume, CVD change
-    delta_p = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2]
-    delta_v = (df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2]
-    delta_cvd = (df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]) / (df['taker_buy_base'].iloc[-2] + 1e-6)
-    alpha, beta, gamma = 0.5, 0.3, 0.2
-    tms = alpha*delta_p + beta*delta_v + gamma*delta_cvd
-    return tms
-
-def calculate_atr(df, period=ATR_PERIOD):
-    high = df['high'].values
-    low = df['low'].values
-    close = df['close'].values
-    atr = talib.ATR(high, low, close, timeperiod=period)
-    return atr[-1]
-
-# ===============================
-# MAIN LOGIC
-# ===============================
 
 obi_history = []
 cvd_history = []
 
-while True:
-    try:
-        # Fetch data
-        bids, asks = get_order_book(SYMBOL)
-        df = get_historical_klines(SYMBOL)
+# ===============================
+# FUNCTIONS
+# ===============================
+async def send_telegram_message(message):
+    async with aiohttp.ClientSession() as session:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": message}
+        async with session.post(url, data=payload) as resp:
+            return await resp.text()
 
-        # Weighted OBI & z-score
-        WOBI = calculate_weighted_obi(bids, asks)
-        obi_history.append(WOBI)
-        if len(obi_history) < 20:
-            continue
-        z_obi = calculate_z_score(obi_history[-20:])
+async def get_order_book(session, symbol, limit=OBI_LEVELS):
+    url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}"
+    async with session.get(url) as resp:
+        data = await resp.json()
+        bids = np.array([[float(price), float(qty)] for price, qty in data['bids']])
+        asks = np.array([[float(price), float(qty)] for price, qty in data['asks']])
+        return bids, asks
 
-        # Trend Momentum Score
-        tms = calculate_tms(df)
+async def get_klines(session, symbol, interval="1m", limit=100):
+    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    async with session.get(url) as resp:
+        data = await resp.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume","close_time",
+            "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
+        ])
+        return df.astype(float)
 
-        # CVD exhaustion filter
-        cvd = df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]
-        cvd_history.append(cvd)
-        z_cvd = calculate_z_score(cvd_history[-20:])
+def calculate_weighted_obi(bids, asks):
+    w = 1 / (np.arange(1, len(bids)+1))
+    return np.sum((bids[:,1] - asks[:,1]) * w) / np.sum(w)
 
-        # ATR-based dynamic position size
-        atr = calculate_atr(df)
-        account_balance = 1000  # Example, replace with live balance
-        position_size = (account_balance * POSITION_RISK) / (atr + 1e-6)
+def calculate_z_score(series):
+    if len(series) < 2:
+        return 0
+    return (series[-1] - np.mean(series)) / np.std(series)
 
-        # ===============================
-        # SIGNAL CONDITIONS
-        # ===============================
-        if z_obi > Z_THRESHOLD and tms > TMS_THRESHOLD and z_cvd < EXHAUSTION_Z:
-            message = f"🚀 LONG SIGNAL | Size: {position_size:.4f} BTC | WOBI z: {z_obi:.2f} | TMS: {tms:.4f}"
-            send_telegram_message(message)
+def calculate_tms(df):
+    delta_p = (df['close'].iloc[-1] - df['close'].iloc[-2]) / df['close'].iloc[-2]
+    delta_v = (df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2]
+    delta_cvd = (df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]) / (df['taker_buy_base'].iloc[-2]+1e-6)
+    alpha, beta, gamma = 0.5, 0.3, 0.2
+    return alpha*delta_p + beta*delta_v + gamma*delta_cvd
 
-        elif z_obi < -Z_THRESHOLD and tms < -TMS_THRESHOLD and z_cvd > -EXHAUSTION_Z:
-            message = f"🔻 SHORT SIGNAL | Size: {position_size:.4f} BTC | WOBI z: {z_obi:.2f} | TMS: {tms:.4f}"
-            send_telegram_message(message)
+def calculate_atr(df, period=ATR_PERIOD):
+    high, low, close = df['high'].values, df['low'].values, df['close'].values
+    atr = talib.ATR(high, low, close, timeperiod=period)
+    return atr[-1]
 
-    except Exception as e:
-        print("Error:", e)
+# ===============================
+# MAIN LOOP
+# ===============================
+async def main():
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                bids, asks = await get_order_book(session, SYMBOL)
+                df = await get_klines(session, SYMBOL)
+
+                # Weighted OBI
+                WOBI = calculate_weighted_obi(bids, asks)
+                obi_history.append(WOBI)
+                z_obi = calculate_z_score(obi_history[-20:])
+
+                # TMS
+                tms = calculate_tms(df)
+
+                # CVD exhaustion
+                cvd = df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]
+                cvd_history.append(cvd)
+                z_cvd = calculate_z_score(cvd_history[-20:])
+
+                # ATR-based position size
+                atr = calculate_atr(df)
+                account_balance = 1000
+                position_size = (account_balance * POSITION_RISK) / (atr+1e-6)
+
+                # Signal conditions
+                if z_obi > Z_THRESHOLD and tms > TMS_THRESHOLD and z_cvd < EXHAUSTION_Z:
+                    await send_telegram_message(f"🚀 LONG | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+
+                elif z_obi < -Z_THRESHOLD and tms < -TMS_THRESHOLD and z_cvd > -EXHAUSTION_Z:
+                    await send_telegram_message(f"🔻 SHORT | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+
+                await asyncio.sleep(1)  # prevent CPU overload
+
+            except Exception as e:
+                print("Error:", e)
+                await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())
