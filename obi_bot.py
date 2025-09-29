@@ -3,44 +3,43 @@ import requests
 from datetime import datetime
 
 # === CONFIG ===
-TOKEN = "YOUR_BOT_TOKEN"  # put your token here
-CHAT_ID = "YOUR_CHAT_ID"  # your Telegram user/chat ID
+TOKEN = "YOUR_BOT_TOKEN"  # keep same as your old working script
+CHAT_ID = "YOUR_CHAT_ID"  # keep same as your old working script
 API_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 def send_message(text):
     try:
-        payload = {"chat_id": CHAT_ID, "text": text}
-        r = requests.post(API_URL, data=payload)
-        print("Message status:", r.json())  # log response
+        r = requests.post(API_URL, data={"chat_id": CHAT_ID, "text": text})
+        print("Telegram response:", r.json())
     except Exception as e:
-        print("Error sending:", e)
+        print("Error:", e)
 
-def check_ofi_signal():
+def calculate_ofi():
     """
-    Your Order Flow Imbalance logic goes here.
-    For now, I’ll simulate a fake condition.
-    Replace this with your real OFI strategy.
+    Replace this dummy logic with your real OFI calculation.
+    For now, I’ll just simulate a random imbalance.
     """
-    # Example: if imbalance > threshold, return signal
-    imbalance = 0  # <-- replace with real calculation
-    threshold = 10
-    if imbalance > threshold:
-        return f"📊 OFI Signal Detected! Imbalance = {imbalance}"
-    else:
-        return None
+    import random
+    imbalance = random.randint(-20, 20)
+    return imbalance
 
 def main():
     while True:
-        # Always send heartbeat
+        # Always send a heartbeat so you know it’s alive
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         send_message(f"✅ Bot alive at {now}")
 
-        # Check for OFI strategy signal
-        signal = check_ofi_signal()
-        if signal:
-            send_message(signal)
+        # OFI strategy
+        imbalance = calculate_ofi()
+        threshold = 10
+        if imbalance > threshold:
+            send_message(f"📊 Buy Signal! OFI={imbalance}")
+        elif imbalance < -threshold:
+            send_message(f"📉 Sell Signal! OFI={imbalance}")
+        else:
+            send_message(f"ℹ️ No trade. OFI={imbalance}")
 
-        time.sleep(60)  # wait 60s before next loop
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
