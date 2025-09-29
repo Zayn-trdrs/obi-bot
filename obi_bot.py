@@ -1,129 +1,80 @@
-import requests
+import os
 import time
-import numpy as np
-from collections import deque
+import requests
 
-# === CONFIG ===
-PAIR = "ETHUSDT"
-RANGE = 500  # ± range around mid price
-INTERVAL = 60  # seconds
-HISTORY = 50  # rolling window for Z-score, VPIN, λ
+# Load secrets from environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# === TELEGRAM CONFIG ===
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
-TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+# Binance ETHUSDT order book endpoint
+BINANCE_DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol=ETHUSDT&limit=5000"
 
-# === STATE ===
-obi_history = deque(maxlen=HISTORY)
-flow_history = deque(maxlen=HISTORY)
-price_history = deque(maxlen=HISTORY)
+def fetch_order_book():
+    """Fetch ETHUSDT order book from Binance."""
+    try:
+        resp = requests.get(BINANCE_DEPTH_URL, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print("Error fetching order book:", e)
+        return None
 
-def fetch_orderbook():
-    url = f"https://api.binance.com/api/v3/depth?symbol={PAIR}&limit=1000"
-    data = requests.get(url).json()
-    bids = [(float(p), float(q)) for p, q in data["bids"]]
-    asks = [(float(p), float(q)) for p, q in data["asks"]]
-    return bids, asks
+def calculate_obi(order_book, price_range=500):
+    """Calculate OBI using raw bid/ask limit orders within ±price_range."""
+    bids = [(float(p), float(q)) for p, q in order_book["bids"]]
+    asks = [(float(p), float(q)) for p, q in order_book["asks"]]
 
-def calculate_metrics(bids, asks):
-    mid = (bids[0][0] + asks[0][0]) / 2
+    # Mid price
+    mid_price = (bids[0][0] + asks[0][0]) / 2
+    lower = mid_price - price_range
+    upper = mid_price + price_range
 
-    # Filter within ±RANGE
-    bid_vol = sum(p * q for p, q in bids if p >= mid - RANGE)
-    ask_vol = sum(p * q for p, q in asks if p <= mid + RANGE)
-    total_vol = bid_vol + ask_vol
+    # Sum bid and ask volumes (price * quantity = USDT)
+    buy_volume = sum(p * q for p, q in bids if p >= lower)
+    sell_volume = sum(p * q for p, q in asks if p <= upper)
 
-    # --- OBI ---
-    obi = ((bid_vol - ask_vol) / total_vol) * 100 if total_vol > 0 else 0
+    total = buy_volume + sell_volume
+    if total == 0:
+        return mid_price, 0, 0, 0
 
-    # Store histories
-    obi_history.append(obi)
-    flow_history.append(bid_vol - ask_vol)
-    price_history.append(mid)
+    buy_pct = (buy_volume / total) * 100
+    sell_pct = (sell_volume / total) * 100
+    obi = ((buy_volume - sell_volume) / total) * 100
 
-    # --- Z-Score OBI ---
-    if len(obi_history) > 10:
-        mu = np.mean(obi_history)
-        sigma = np.std(obi_history)
-        zobi = (obi - mu) / sigma if sigma > 0 else 0
-    else:
-        zobi = 0
+    return mid_price, buy_volume, sell_volume, obi, buy_pct, sell_pct
 
-    # --- VPIN ---
-    if len(flow_history) > 1:
-        vpin = np.mean([abs(f) for f in flow_history]) / (np.mean([abs(f) for f in flow_history]) + 1e-9)
-    else:
-        vpin = 0
-
-    # --- Kyle's Lambda ---
-    if len(flow_history) > 2:
-        delta_p = price_history[-1] - price_history[-2]
-        delta_f = flow_history[-1]
-        lambd = (delta_p / delta_f) if delta_f != 0 else 0
-    else:
-        lambd = 0
-
-    return mid, bid_vol, ask_vol, obi, zobi, vpin, lambd
-
-def interpret(obi, zobi, vpin, lambd):
-    # OBI interpretation
-    obi_dir = "🟢 Bullish" if obi > 0 else "🔴 Bearish"
-
-    # ZOBI interpretation
-    if zobi > 2:
-        zobi_txt = f"{zobi:.2f} (Strong Bullish)"
-    elif zobi < -2:
-        zobi_txt = f"{zobi:.2f} (Strong Bearish)"
-    else:
-        zobi_txt = f"{zobi:.2f} (Neutral)"
-
-    # VPIN interpretation
-    if vpin > 0.6:
-        vpin_txt = f"{vpin:.2f} (High Toxicity)"
-    elif vpin > 0.3:
-        vpin_txt = f"{vpin:.2f} (Medium Toxicity)"
-    else:
-        vpin_txt = f"{vpin:.2f} (Low Toxicity)"
-
-    # Lambda interpretation
-    if abs(lambd) > 0.005:
-        lambd_txt = f"{lambd:.4f} (Fragile Market)"
-    elif abs(lambd) > 0.001:
-        lambd_txt = f"{lambd:.4f} (Normal Impact)"
-    else:
-        lambd_txt = f"{lambd:.4f} (Stable Market)"
-
-    return obi_dir, zobi_txt, vpin_txt, lambd_txt
-
-def send_message(msg):
-    payload = {"chat_id": CHAT_ID, "text": msg}
-    requests.post(TELEGRAM_URL, data=payload)
+def send_telegram(msg):
+    """Send message to Telegram bot."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    except Exception as e:
+        print("Error sending Telegram message:", e)
 
 def main():
     while True:
-        try:
-            bids, asks = fetch_orderbook()
-            mid, bid_vol, ask_vol, obi, zobi, vpin, lambd = calculate_metrics(bids, asks)
-            obi_dir, zobi_txt, vpin_txt, lambd_txt = interpret(obi, zobi, vpin, lambd)
+        order_book = fetch_order_book()
+        if order_book:
+            mid, buy_vol, sell_vol, obi, buy_pct, sell_pct = calculate_obi(order_book)
 
-            msg = (
-                f"📊 {PAIR} OBI Report (±{RANGE} range)\n"
+            signal = ""
+            if obi >= 10:
+                signal = "📈 LONG Signal"
+            elif obi <= -10:
+                signal = "📉 SHORT Signal"
+
+            message = (
+                f"📊 ETH OBI Report (±500 range)\n"
                 f"💰 Mid Price: {mid:.2f}\n"
-                f"🟢 Buy Vol: {bid_vol:,.2f} USDT\n"
-                f"🔴 Sell Vol: {ask_vol:,.2f} USDT\n"
-                f"⚖️ Net OBI: {obi:.2f}% ({obi_dir})\n\n"
-                f"📈 Advanced Stats:\n"
-                f"🔹 ZOBI: {zobi_txt}\n"
-                f"🔹 VPIN: {vpin_txt}\n"
-                f"🔹 λ (Impact): {lambd_txt}"
+                f"📉 Range: {mid-500:.2f} → {mid+500:.2f}\n"
+                f"🟢 Buy Volume: {buy_vol:,.2f} USDT ({buy_pct:.2f}%)\n"
+                f"🔴 Sell Volume: {sell_vol:,.2f} USDT ({sell_pct:.2f}%)\n"
+                f"⚖️ Net OBI: {obi:.2f}%\n"
+                f"{signal}"
             )
+            send_telegram(message)
 
-            send_message(msg)
-        except Exception as e:
-            send_message(f"⚠️ Error: {e}")
-
-        time.sleep(INTERVAL)
+        time.sleep(60)  # wait 60 seconds
 
 if __name__ == "__main__":
     main()
