@@ -41,12 +41,18 @@ def job():
         curr_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
         if prev_book:
             ofi = calculate_ofi(prev_book, curr_book)
+
+            # Always send debug message
+            bot.send_message(CHAT_ID, f"🔍 Debug: OFI={ofi:.2f} | Threshold={THRESHOLD}")
+
+            # Signal logic
             if ofi > THRESHOLD:
-                bot.send_message(CHAT_ID, f"📈 BUY SIGNAL: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, "📈 BUY SIGNAL")
             elif ofi < -THRESHOLD:
-                bot.send_message(CHAT_ID, f"📉 SELL SIGNAL: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, "📉 SELL SIGNAL")
             else:
-                bot.send_message(CHAT_ID, f"⚖️ Neutral: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, "⚖️ Neutral")
+
         prev_book = curr_book
     except Exception as e:
         bot.send_message(CHAT_ID, f"⚠️ Error: {e}")
