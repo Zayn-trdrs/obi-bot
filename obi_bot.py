@@ -1,7 +1,6 @@
 import os
 import time
-import schedule
-import telebot
+import requests
 from binance.client import Client
 
 # ---------------- CONFIG ----------------
@@ -12,10 +11,10 @@ DEPTH_LIMIT = int(os.getenv("DEPTH_LIMIT", 5))
 THRESHOLD = float(os.getenv("THRESHOLD", 100))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+INTERVAL = int(os.getenv("INTERVAL", 60))  # in seconds
 # ----------------------------------------
 
 client = Client(API_KEY, API_SECRET)
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 prev_book = None
 
@@ -35,31 +34,44 @@ def calculate_ofi(prev, curr):
             ofi -= (size_curr - size_prev)
     return ofi
 
-def job():
-    global prev_book
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg}
     try:
-        curr_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
-        if prev_book:
-            ofi = calculate_ofi(prev_book, curr_book)
-
-            # Always send debug message
-            bot.send_message(CHAT_ID, f"🔍 Debug: OFI={ofi:.2f} | Threshold={THRESHOLD}")
-
-            # Signal logic
-            if ofi > THRESHOLD:
-                bot.send_message(CHAT_ID, "📈 BUY SIGNAL")
-            elif ofi < -THRESHOLD:
-                bot.send_message(CHAT_ID, "📉 SELL SIGNAL")
-            else:
-                bot.send_message(CHAT_ID, "⚖️ Neutral")
-
-        prev_book = curr_book
+        r = requests.post(url, json=payload, timeout=10)
+        print("Telegram response:", r.text)
     except Exception as e:
-        bot.send_message(CHAT_ID, f"⚠️ Error: {e}")
+        print("Telegram error:", e)
 
-# Schedule every 1 minute
-schedule.every(1).minutes.do(job)
+def run():
+    global prev_book
+    while True:
+        try:
+            curr_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
+            if prev_book:
+                ofi = calculate_ofi(prev_book, curr_book)
 
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+                # Always log + send debug
+                debug_msg = f"🔍 OFI={ofi:.2f} | Threshold={THRESHOLD}"
+                print(debug_msg)
+                send_telegram(debug_msg)
+
+                if ofi > THRESHOLD:
+                    send_telegram("📈 BUY SIGNAL")
+                elif ofi < -THRESHOLD:
+                    send_telegram("📉 SELL SIGNAL")
+                else:
+                    send_telegram("⚖️ Neutral")
+
+            prev_book = curr_book
+            time.sleep(INTERVAL)
+
+        except Exception as e:
+            error_msg = f"⚠️ Error: {e}"
+            print(error_msg)
+            send_telegram(error_msg)
+            time.sleep(INTERVAL)
+
+if __name__ == "__main__":
+    send_telegram(f"🤖 Bot started for {SYMBOL}")
+    run()
