@@ -6,77 +6,74 @@ import time
 # =========================
 TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
 TELEGRAM_CHAT_ID = 'YOUR_CHAT_ID'
-SYMBOL = 'BTCUSDT'        # Trading pair
-DEPTH_LIMIT = 10          # Top levels to calculate OFI
-OFI_THRESHOLD = 10        # Percent to trigger signal
-TP_MULTIPLIER = 2         # Take profit = RR * SL
-SL_PERCENT = 0.2          # Stop loss in percent
+MIN_PROFIT_PKR = 1  # Minimum profit in PKR to alert
+CHECK_INTERVAL = 10  # seconds between checks
+
+# Exchanges and P2P API endpoints
+EXCHANGES = {
+    "Binance": "https://api.binance.com/api/v3/ticker/price?symbol=USDTBUSD",
+    "KuCoin": "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=USDT-USDT",
+    "MEXC": "https://www.mexc.com/api/v3/ticker/price?symbol=USDTUSDT",
+    "OKX": "https://www.okx.com/api/spot/v3/instruments/USDT-USDT/ticker",
+    # Add more endpoints as needed
+}
 
 # =========================
 # HELPER FUNCTIONS
 # =========================
-def get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT):
-    url = f'https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}'
-    response = requests.get(url)
-    return response.json()
-
-def calculate_ofi(order_book):
-    bid_volume = sum([float(level[1]) for level in order_book['bids']])
-    ask_volume = sum([float(level[1]) for level in order_book['asks']])
-    ofi = bid_volume - ask_volume
-    ofi_percent = ofi / (bid_volume + ask_volume) * 100
-    return ofi_percent
+def get_price(exchange_name, url):
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        # Adjust according to each API's structure
+        if exchange_name == "Binance":
+            return float(data['price'])
+        elif exchange_name == "KuCoin":
+            return float(data['data']['price'])
+        elif exchange_name == "MEXC":
+            return float(data['price'])
+        elif exchange_name == "OKX":
+            return float(data['last'])
+        else:
+            return None
+    except Exception as e:
+        print(f"Error fetching price from {exchange_name}: {e}")
+        return None
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     requests.post(url, data=data)
 
-def generate_signal(ofi_percent, last_price):
-    if ofi_percent > OFI_THRESHOLD:
-        direction = 'LONG'
-        entry = last_price
-        sl = entry * (1 - SL_PERCENT/100)
-        tp = entry + (entry - sl) * TP_MULTIPLIER
-    elif ofi_percent < -OFI_THRESHOLD:
-        direction = 'SHORT'
-        entry = last_price
-        sl = entry * (1 + SL_PERCENT/100)
-        tp = entry - (sl - entry) * TP_MULTIPLIER
-    else:
-        return None
-
-    message = (
-        f"📈 OFI SIGNAL 📉\n"
-        f"Pair: {SYMBOL}\n"
-        f"Direction: {direction}\n"
-        f"Entry: {entry:.2f}\n"
-        f"Stop Loss: {sl:.2f}\n"
-        f"Take Profit: {tp:.2f}\n"
-        f"OFI%: {ofi_percent:.2f}%"
-    )
-    return message
-
 # =========================
 # MAIN LOOP
 # =========================
 if __name__ == '__main__':
-    print("🚀 OFI Telegram Bot Started")
-    last_signal = None
+    print("🚀 Arbitrage Signal Bot Started")
     while True:
-        try:
-            order_book = get_order_book()
-            ofi_percent = calculate_ofi(order_book)
-            last_price = (float(order_book['bids'][0][0]) + float(order_book['asks'][0][0])) / 2
-            signal_message = generate_signal(ofi_percent, last_price)
+        prices = {}
+        for name, url in EXCHANGES.items():
+            price = get_price(name, url)
+            if price:
+                prices[name] = price
 
-            # Avoid duplicate signals
-            if signal_message and signal_message != last_signal:
-                send_telegram(signal_message)
-                last_signal = signal_message
-                print(signal_message)
+        if len(prices) < 2:
+            time.sleep(CHECK_INTERVAL)
+            continue
 
-            time.sleep(1)  # check every second
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(5)
+        # Find min and max price
+        buy_exchange = min(prices, key=prices.get)
+        sell_exchange = max(prices, key=prices.get)
+        profit = prices[sell_exchange] - prices[buy_exchange]
+
+        if profit >= MIN_PROFIT_PKR:
+            message = (
+                f"💰 Arbitrage Opportunity 💰\n"
+                f"Buy on: {buy_exchange} at {prices[buy_exchange]:.2f} PKR\n"
+                f"Sell on: {sell_exchange} at {prices[sell_exchange]:.2f} PKR\n"
+                f"Potential Profit: {profit:.2f} PKR"
+            )
+            send_telegram(message)
+            print(message)
+
+        time.sleep(CHECK_INTERVAL)
