@@ -1,11 +1,9 @@
 import requests
 
-BOT_TOKEN = "your-bot-token-here"
-CHAT_ID = "your-chat-id-here"
+BOT_TOKEN = "your-correct-bot-token"
+CHAT_ID = "your-chat-id"
 
 resp = requests.get(
-    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-    params={"chat_id": CHAT_ID, "text": "Hello from Render test ✅"}
+    f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
 )
-
 print(resp.json())
