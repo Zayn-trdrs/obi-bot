@@ -1,16 +1,11 @@
-import time, requests
+import requests
 
-BOT_TOKEN = "your-bot-token"
-CHAT_ID = "your-chat-id"
+BOT_TOKEN = "your-bot-token-here"
+CHAT_ID = "your-chat-id-here"
 
-def send_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-        print(r.json())
-    except Exception as e:
-        print("Error sending:", e)
+resp = requests.get(
+    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+    params={"chat_id": CHAT_ID, "text": "Hello from Render test ✅"}
+)
 
-while True:
-    send_message("Worker is alive ✅")
-    time.sleep(60)   # send every minute
+print(resp.json())
