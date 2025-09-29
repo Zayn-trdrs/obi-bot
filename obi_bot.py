@@ -1,8 +1,10 @@
-import asyncio
-import aiohttp
 import numpy as np
 import pandas as pd
+import requests
+import json
+import os
 import talib
+from datetime import datetime
 
 # ===============================
 # CONFIG
@@ -17,36 +19,31 @@ EXHAUSTION_Z = 2
 TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 CHAT_ID = "YOUR_CHAT_ID"
 
-obi_history = []
-cvd_history = []
+STATE_FILE = "bot_state.json"  # persistent storage for cooldown
 
 # ===============================
-# FUNCTIONS
+# HELPER FUNCTIONS
 # ===============================
-async def send_telegram_message(message):
-    async with aiohttp.ClientSession() as session:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": message}
-        async with session.post(url, data=payload) as resp:
-            return await resp.text()
 
-async def get_order_book(session, symbol, limit=OBI_LEVELS):
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+
+def get_order_book(symbol, limit=OBI_LEVELS):
     url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={limit}"
-    async with session.get(url) as resp:
-        data = await resp.json()
-        bids = np.array([[float(price), float(qty)] for price, qty in data['bids']])
-        asks = np.array([[float(price), float(qty)] for price, qty in data['asks']])
-        return bids, asks
+    data = requests.get(url).json()
+    bids = np.array([[float(price), float(qty)] for price, qty in data['bids']])
+    asks = np.array([[float(price), float(qty)] for price, qty in data['asks']])
+    return bids, asks
 
-async def get_klines(session, symbol, interval="1m", limit=100):
+def get_klines(symbol, interval="1m", limit=100):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    async with session.get(url) as resp:
-        data = await resp.json()
-        df = pd.DataFrame(data, columns=[
-            "open_time","open","high","low","close","volume","close_time",
-            "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
-        ])
-        return df.astype(float)
+    data = requests.get(url).json()
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume","close_time",
+        "quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
+    ])
+    return df.astype(float)
 
 def calculate_weighted_obi(bids, asks):
     w = 1 / (np.arange(1, len(bids)+1))
@@ -69,46 +66,82 @@ def calculate_atr(df, period=ATR_PERIOD):
     atr = talib.ATR(high, low, close, timeperiod=period)
     return atr[-1]
 
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"last_signal": None, "timestamp": 0}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
 # ===============================
-# MAIN LOOP
+# MAIN LOGIC
 # ===============================
-async def main():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                bids, asks = await get_order_book(session, SYMBOL)
-                df = await get_klines(session, SYMBOL)
 
-                # Weighted OBI
-                WOBI = calculate_weighted_obi(bids, asks)
-                obi_history.append(WOBI)
-                z_obi = calculate_z_score(obi_history[-20:])
+def main():
+    try:
+        state = load_state()
 
-                # TMS
-                tms = calculate_tms(df)
+        # Fetch data
+        bids, asks = get_order_book(SYMBOL)
+        df = get_klines(SYMBOL)
 
-                # CVD exhaustion
-                cvd = df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]
-                cvd_history.append(cvd)
-                z_cvd = calculate_z_score(cvd_history[-20:])
+        # Weighted OBI
+        WOBI = calculate_weighted_obi(bids, asks)
+        if "obi_history" not in state:
+            state["obi_history"] = []
+        state["obi_history"].append(WOBI)
+        if len(state["obi_history"]) > 20:
+            state["obi_history"] = state["obi_history"][-20:]
+        z_obi = calculate_z_score(state["obi_history"])
 
-                # ATR-based position size
-                atr = calculate_atr(df)
-                account_balance = 1000
-                position_size = (account_balance * POSITION_RISK) / (atr+1e-6)
+        # Trend Momentum Score
+        tms = calculate_tms(df)
 
-                # Signal conditions
-                if z_obi > Z_THRESHOLD and tms > TMS_THRESHOLD and z_cvd < EXHAUSTION_Z:
-                    await send_telegram_message(f"🚀 LONG | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+        # CVD exhaustion
+        cvd = df['taker_buy_base'].iloc[-1] - df['taker_buy_base'].iloc[-2]
+        if "cvd_history" not in state:
+            state["cvd_history"] = []
+        state["cvd_history"].append(cvd)
+        if len(state["cvd_history"]) > 20:
+            state["cvd_history"] = state["cvd_history"][-20:]
+        z_cvd = calculate_z_score(state["cvd_history"])
 
-                elif z_obi < -Z_THRESHOLD and tms < -TMS_THRESHOLD and z_cvd > -EXHAUSTION_Z:
-                    await send_telegram_message(f"🔻 SHORT | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+        # ATR-based position size
+        atr = calculate_atr(df)
+        account_balance = 1000
+        position_size = (account_balance * POSITION_RISK) / (atr+1e-6)
 
-                await asyncio.sleep(1)  # prevent CPU overload
+        # Cooldown check: 1-minute cooldown
+        cooldown_seconds = 60
+        last_signal_time = state.get("timestamp", 0)
+        now_ts = int(datetime.now().timestamp())
+        if now_ts - last_signal_time < cooldown_seconds:
+            print("Cooldown active, skipping signal")
+            save_state(state)
+            return
 
-            except Exception as e:
-                print("Error:", e)
-                await asyncio.sleep(5)
+        # Signal conditions
+        signal_sent = False
+        if z_obi > Z_THRESHOLD and tms > TMS_THRESHOLD and z_cvd < EXHAUSTION_Z:
+            send_telegram_message(f"🚀 LONG | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+            state["last_signal"] = "LONG"
+            signal_sent = True
+
+        elif z_obi < -Z_THRESHOLD and tms < -TMS_THRESHOLD and z_cvd > -EXHAUSTION_Z:
+            send_telegram_message(f"🔻 SHORT | Size: {position_size:.4f} | WOBI z:{z_obi:.2f} TMS:{tms:.4f}")
+            state["last_signal"] = "SHORT"
+            signal_sent = True
+
+        if signal_sent:
+            state["timestamp"] = now_ts
+
+        save_state(state)
+
+    except Exception as e:
+        print("Error:", e)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
