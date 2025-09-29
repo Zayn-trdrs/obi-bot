@@ -2,12 +2,19 @@ import os
 import time
 import requests
 
-# Load secrets from environment variables
+# ================= Config =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # Binance ETHUSDT order book endpoint
 BINANCE_DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol=ETHUSDT&limit=5000"
+
+# Wall & distance thresholds
+MIN_WALL_USDT = 100000      # ignore small walls
+MIN_TP_DISTANCE = 0.005     # 0.5% minimum TP distance
+MIN_SL_DISTANCE = 0.003     # 0.3% minimum SL distance
+# ==========================================
+
 
 def fetch_order_book():
     """Fetch ETHUSDT order book from Binance."""
@@ -18,6 +25,7 @@ def fetch_order_book():
     except Exception as e:
         print("Error fetching order book:", e)
         return None
+
 
 def calculate_obi(order_book, price_range=500):
     """Calculate OBI using raw bid/ask limit orders within ±price_range."""
@@ -43,41 +51,59 @@ def calculate_obi(order_book, price_range=500):
 
     return mid_price, buy_volume, sell_volume, obi, buy_pct, sell_pct, bids, asks
 
-def find_tp_sl(mid_price, obi, bids, asks):
-    """
-    Determine TP and SL based on nearest order book walls and OBI strength.
-    - For LONG: TP = nearest sell wall (ask), SL = nearest buy wall (bid)
-    - For SHORT: TP = nearest buy wall (bid), SL = nearest sell wall (ask)
-    """
-    tp, sl, rr = None, None, None
-    direction = None
 
-    if obi >= 10:  # LONG
-        direction = "LONG"
-        # find nearest big ask wall (sell resistance)
-        tp_candidates = sorted(asks, key=lambda x: x[0])[:3]
-        tp = tp_candidates[0][0] if tp_candidates else mid_price * 1.01
-        # find nearest strong bid wall below price (support)
-        sl_candidates = [b for b in bids if b[0] < mid_price]
-        sl = max(sl_candidates, key=lambda x: x[0])[0] if sl_candidates else mid_price * 0.99
+def find_levels(mid, bids, asks, direction, obi):
+    """Find TP and SL based on strong walls & OBI strength."""
+    entry = mid
+    tp, sl = None, None
 
-    elif obi <= -10:  # SHORT
-        direction = "SHORT"
-        # find nearest big bid wall (buy support)
-        tp_candidates = sorted(bids, key=lambda x: -x[0])[:3]
-        tp = tp_candidates[0][0] if tp_candidates else mid_price * 0.99
-        # find nearest strong ask wall above price (resistance)
-        sl_candidates = [a for a in asks if a[0] > mid_price]
-        sl = min(sl_candidates, key=lambda x: x[0])[0] if sl_candidates else mid_price * 1.01
+    if direction == "LONG":
+        # SL = nearest strong bid wall below
+        for price, qty in bids:
+            usdt = price * qty
+            if usdt >= MIN_WALL_USDT and (entry - price) / entry >= MIN_SL_DISTANCE:
+                sl = price
+                break
+        # TP = ask walls above, choose depending on OBI strength
+        wall_count = 0
+        for price, qty in asks:
+            usdt = price * qty
+            if usdt >= MIN_WALL_USDT and (price - entry) / entry >= MIN_TP_DISTANCE:
+                wall_count += 1
+                if (obi < 20 and wall_count == 1) or (20 <= obi < 40 and wall_count == 2) or (obi >= 40 and wall_count == 3):
+                    tp = price
+                    break
 
-    # Calculate RR ratio
-    if tp and sl and direction:
-        if direction == "LONG":
-            rr = abs((tp - mid_price) / (mid_price - sl)) if (mid_price - sl) != 0 else None
-        elif direction == "SHORT":
-            rr = abs((mid_price - tp) / (sl - mid_price)) if (sl - mid_price) != 0 else None
+    elif direction == "SHORT":
+        # SL = nearest strong ask wall above
+        for price, qty in asks:
+            usdt = price * qty
+            if usdt >= MIN_WALL_USDT and (price - entry) / entry >= MIN_SL_DISTANCE:
+                sl = price
+                break
+        # TP = bid walls below
+        wall_count = 0
+        for price, qty in bids:
+            usdt = price * qty
+            if usdt >= MIN_WALL_USDT and (entry - price) / entry >= MIN_TP_DISTANCE:
+                wall_count += 1
+                if (obi > -20 and wall_count == 1) or (-40 <= obi <= -20 and wall_count == 2) or (obi <= -40 and wall_count == 3):
+                    tp = price
+                    break
 
-    return direction, tp, sl, rr
+    # Fallbacks if no valid wall found
+    if not tp:
+        tp = entry * (1.01 if direction == "LONG" else 0.99)
+    if not sl:
+        sl = entry * (0.995 if direction == "LONG" else 1.005)
+
+    # Calculate RR
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    rr = reward / risk if risk > 0 else 0
+
+    return tp, sl, rr
+
 
 def send_telegram(msg):
     """Send message to Telegram bot."""
@@ -87,6 +113,7 @@ def send_telegram(msg):
     except Exception as e:
         print("Error sending Telegram message:", e)
 
+
 def main():
     while True:
         order_book = fetch_order_book()
@@ -95,13 +122,13 @@ def main():
 
             signal = ""
             tp, sl, rr = None, None, None
-            direction, tp, sl, rr = find_tp_sl(mid, obi, bids, asks)
 
-            if direction:
-                if direction == "LONG":
-                    signal = f"📈 LONG Signal\n🎯 TP: {tp:.2f}\n🛑 SL: {sl:.2f}\n📐 RR: {rr:.2f}"
-                elif direction == "SHORT":
-                    signal = f"📉 SHORT Signal\n🎯 TP: {tp:.2f}\n🛑 SL: {sl:.2f}\n📐 RR: {rr:.2f}"
+            if obi >= 10:
+                signal = "📈 LONG Signal"
+                tp, sl, rr = find_levels(mid, bids, asks, "LONG", obi)
+            elif obi <= -10:
+                signal = "📉 SHORT Signal"
+                tp, sl, rr = find_levels(mid, bids, asks, "SHORT", obi)
 
             message = (
                 f"📊 ETH OBI Report (±500 range)\n"
@@ -109,12 +136,21 @@ def main():
                 f"📉 Range: {mid-500:.2f} → {mid+500:.2f}\n"
                 f"🟢 Buy Volume: {buy_vol:,.2f} USDT ({buy_pct:.2f}%)\n"
                 f"🔴 Sell Volume: {sell_vol:,.2f} USDT ({sell_pct:.2f}%)\n"
-                f"⚖️ Net OBI: {obi:.2f}%\n\n"
+                f"⚖️ Net OBI: {obi:.2f}%\n"
                 f"{signal}"
             )
+
+            if signal:
+                message += (
+                    f"\n🎯 TP: {tp:.2f}\n"
+                    f"🛑 SL: {sl:.2f}\n"
+                    f"📐 RR: {rr:.2f}"
+                )
+
             send_telegram(message)
 
         time.sleep(60)  # wait 60 seconds
+
 
 if __name__ == "__main__":
     main()
