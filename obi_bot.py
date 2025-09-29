@@ -1,15 +1,14 @@
 import time
-import requests
+import schedule
 import telebot
 from binance.client import Client
 
 # ---------------- CONFIG ----------------
 API_KEY = "your_binance_api_key"
 API_SECRET = "your_binance_api_secret"
-SYMBOL = "BTCUSDT"  # change to your pair
-DEPTH_LIMIT = 5     # how many levels of orderbook to fetch
-INTERVAL = 60       # seconds
-THRESHOLD = 100     # imbalance threshold (tune this)
+SYMBOL = "BTCUSDT"
+DEPTH_LIMIT = 5
+THRESHOLD = 100
 TELEGRAM_TOKEN = "your_telegram_bot_token"
 CHAT_ID = "your_chat_id"
 # ----------------------------------------
@@ -17,12 +16,9 @@ CHAT_ID = "your_chat_id"
 client = Client(API_KEY, API_SECRET)
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# --- Hasbrouck OFI calculation ---
+prev_book = None
+
 def calculate_ofi(prev, curr):
-    """
-    Hasbrouck’s OFI approximation:
-    OFI = sum(ΔBidSize if BidPrice ↑ or same, ΔAskSize if AskPrice ↓ or same)
-    """
     ofi = 0
     for i in range(min(len(prev["bids"]), len(curr["bids"]))):
         bid_prev, size_prev = float(prev["bids"][i][0]), float(prev["bids"][i][1])
@@ -35,35 +31,27 @@ def calculate_ofi(prev, curr):
         ask_curr, size_curr = float(curr["asks"][i][0]), float(curr["asks"][i][1])
         if ask_curr <= ask_prev:
             ofi -= (size_curr - size_prev)
-
     return ofi
 
-def send_signal(message):
-    bot.send_message(CHAT_ID, message)
-
-# --- Main loop ---
-def run():
-    prev_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
-    time.sleep(INTERVAL)
-
-    while True:
-        try:
-            curr_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
+def job():
+    global prev_book
+    try:
+        curr_book = client.get_order_book(symbol=SYMBOL, limit=DEPTH_LIMIT)
+        if prev_book:
             ofi = calculate_ofi(prev_book, curr_book)
-
             if ofi > THRESHOLD:
-                send_signal(f"📈 BUY SIGNAL: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, f"📈 BUY SIGNAL: OFI={ofi:.2f}")
             elif ofi < -THRESHOLD:
-                send_signal(f"📉 SELL SIGNAL: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, f"📉 SELL SIGNAL: OFI={ofi:.2f}")
             else:
-                send_signal(f"⚖️ Neutral: OFI={ofi:.2f}")
+                bot.send_message(CHAT_ID, f"⚖️ Neutral: OFI={ofi:.2f}")
+        prev_book = curr_book
+    except Exception as e:
+        bot.send_message(CHAT_ID, f"⚠️ Error: {e}")
 
-            prev_book = curr_book
-            time.sleep(INTERVAL)
+# Schedule every 1 minute
+schedule.every(1).minutes.do(job)
 
-        except Exception as e:
-            send_signal(f"⚠️ Error: {e}")
-            time.sleep(INTERVAL)
-
-if __name__ == "__main__":
-    run()
+while True:
+    schedule.run_pending()
+    time.sleep(1)
