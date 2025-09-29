@@ -1,16 +1,17 @@
+import os
 import time
 import schedule
 import telebot
 from binance.client import Client
 
 # ---------------- CONFIG ----------------
-API_KEY = "your_binance_api_key"
-API_SECRET = "your_binance_api_secret"
-SYMBOL = "BTCUSDT"
-DEPTH_LIMIT = 5
-THRESHOLD = 100
-TELEGRAM_TOKEN = "your_telegram_bot_token"
-CHAT_ID = "your_chat_id"
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")   # default BTCUSDT
+DEPTH_LIMIT = int(os.getenv("DEPTH_LIMIT", 5))
+THRESHOLD = float(os.getenv("THRESHOLD", 100))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ----------------------------------------
 
 client = Client(API_KEY, API_SECRET)
@@ -19,6 +20,7 @@ bot = telebot.TeleBot(TELEGRAM_TOKEN)
 prev_book = None
 
 def calculate_ofi(prev, curr):
+    """Hasbrouck Order Flow Imbalance (OFI)"""
     ofi = 0
     for i in range(min(len(prev["bids"]), len(curr["bids"]))):
         bid_prev, size_prev = float(prev["bids"][i][0]), float(prev["bids"][i][1])
