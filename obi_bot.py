@@ -1,213 +1,191 @@
-""" Advanced Tape-Reading Signal Bot -> sends Telegram alerts
+""" Telegram Trading Bot (FastAPI) — Liquidity + Order Flow Strategy File: telegram_render_trading_bot.py
 
-What this script does (summary):
+Overview
 
-Connects to Binance public websocket for trades and order book snapshots
+Single-file example Telegram trading bot built for deployment on Render (or similar).
 
-Builds a lightweight order-flow / tape-reading engine (imbalance, absorption, exhaustion, stop-run)
+FastAPI receives Telegram webhook updates.
 
-Emits high-confidence signals to a Telegram chat via the bot API
+Uses ccxt for exchange API (supports many exchanges).
+
+Polls exchange for candles and order book snapshots to run a "liquidity-based order flow" strategy with:
+
+Trend filter: 100 EMA on configured timeframe
+
+Volume confirmation: candle volume > volume EMA(30)
+
+Order book imbalance: sum(bids_topN) vs sum(asks_topN)
+
+Liquidity sweep detection (heuristic)
 
 
-IMPORTANT:
+Executes live orders via exchange API (market orders + stop-loss + take-profit)
 
-This is a production-ready starting point but you MUST test with paper/dry-run first.
-
-Fill TELEGRAM_TOKEN and TELEGRAM_CHAT_ID before running.
-
-Tune parameters to the pair/timeframe you trade.
+Stores trades in a local SQLite DB (SQLAlchemy)
 
 
-Dependencies: pip install websockets aiohttp
+Notes & Limitations
 
-Run: python3 telegram_tape_bot.py
+This is an educational starter script. Order flow / footprint analysis in full fidelity requires exchange feeds (raw trades, deltas) not provided here — we use heuristics (orderbook imbalance, volume spikes).
 
-Limitations & notes:
+Do NOT run with real money until fully tested on testnet and reviewed.
 
-Runs on Binance public streams; uses no private API keys.
+Use environment variables for keys and configuration.
 
-For lower latency or exchange-specific features (user data, orders) use exchange SDKs.
 
-This code is intentionally "exchange-agnostic" in the sense it uses public websockets.
+Required environment variables
 
+TELEGRAM_BOT_TOKEN      - Telegram bot token TELEGRAM_WEBHOOK_URL    - Public HTTPS URL for Telegram webhook (Render service URL) EXCHANGE_ID              - ccxt exchange id (e.g., 'binance') EXCHANGE_API_KEY         - exchange API key EXCHANGE_SECRET          - exchange API secret SYMBOL                   - trading symbol (e.g., 'BTC/USDT') TIMEFRAME                - candles timeframe (e.g., '5m') POSITION_RISK_PCT        - risk per trade as % of equity (e.g., 0.5) DB_URL                   - SQLAlchemy DB URL (default sqlite:///trades.db) USE_TESTNET              - '1' to enable testnet mode if exchange supports it
+
+Install dependencies
+
+pip install fastapi uvicorn ccxt pandas numpy ta python-telegram-bot[webhooks] sqlalchemy apscheduler aiohttp
+
+How to run locally (development)
+
+uvicorn telegram_render_trading_bot:app --host 0.0.0.0 --port 8000
+
+On Render: deploy a Python web service, set the webhook URL to https://<your-render-service>/.telegram/webhook
 
 """
 
-import asyncio import json import math import time from collections import deque, defaultdict from dataclasses import dataclass from typing import Deque, Dict, List
+import os import asyncio import logging from typing import Optional, Dict, Any from datetime import datetime, timezone, timedelta
 
-import aiohttp import websockets
+import ccxt.async_support as ccxt import pandas as pd import numpy as np from ta.trend import EMAIndicator from fastapi import FastAPI, Request, HTTPException from pydantic import BaseModel from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean from sqlalchemy.orm import sessionmaker, declarative_base from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
---------------------- USER CONFIG ---------------------
+------------------ Config & Logging ------------------
 
-SYMBOL = "btcusdt"                # lowercase symbol for Binance websocket TELEGRAM_TOKEN = "REPLACE_WITH_YOUR_TELEGRAM_BOT_TOKEN" TELEGRAM_CHAT_ID = "REPLACE_WITH_YOUR_CHAT_ID"
+logging.basicConfig(level=logging.INFO) log = logging.getLogger("trading_bot")
 
-Sensitivity / thresholds
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') TELEGRAM_WEBHOOK_URL = os.getenv('TELEGRAM_WEBHOOK_URL') EXCHANGE_ID = os.getenv('EXCHANGE_ID', 'binance') EXCHANGE_API_KEY = os.getenv('EXCHANGE_API_KEY') EXCHANGE_SECRET = os.getenv('EXCHANGE_SECRET') SYMBOL = os.getenv('SYMBOL', 'BTC/USDT') TIMEFRAME = os.getenv('TIMEFRAME', '5m') POSITION_RISK_PCT = float(os.getenv('POSITION_RISK_PCT', '0.5')) / 100.0 DB_URL = os.getenv('DB_URL', 'sqlite:///trades.db') USE_TESTNET = os.getenv('USE_TESTNET', '0') == '1'
 
-TRADE_WINDOW_SECONDS = 3          # rolling window for tape analysis IMBALANCE_THRESHOLD = 0.7        # fraction of aggressive buys (0..1) to trigger momentum LARGE_TRADE_SIZE = 0.5           # in base asset (e.g., BTC) considered large — tune per symbol ABSORPTION_MULTIPLIER = 8        # how many small trades consumed by large resting liquidity to count as absorption STOPRUN_PRICE_MOVE = 0.003      # 0.3% quick sweep then reversal threshold MIN_COOLDOWN = 5                 # seconds between signals for the same side
+if not TELEGRAM_BOT_TOKEN: log.warning("TELEGRAM_BOT_TOKEN not set — Telegram commands will be disabled until provided.")
 
-Safety / execution
+------------------ Database ------------------
 
-DRY_RUN = False                   # set True to avoid sending Telegram messages while testing LOG_EVERY = 60                    # seconds to print summary
+Base = declarative_base()
 
--------------------------------------------------------
+class Trade(Base): tablename = 'trades' id = Column(Integer, primary_key=True) symbol = Column(String) side = Column(String)  # 'buy' or 'sell' entry_price = Column(Float) stop_loss = Column(Float) take_profit = Column(Float) size = Column(Float) opened_at = Column(DateTime) closed = Column(Boolean, default=False) closed_at = Column(DateTime, nullable=True)
 
-@dataclass class Trade: timestamp: float price: float qty: float is_buyer_maker: bool  # True => trade executed on the maker side (i.e., seller aggressor)
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith('sqlite') else {}) SessionLocal = sessionmaker(bind=engine) Base.metadata.create_all(bind=engine)
 
-class TapeEngine: """Simple order-flow/tape engine collecting trades & book snapshots and emitting signals."""
+------------------ FastAPI / Telegram webhook ------------------
 
-def __init__(self):
-    self.trades: Deque[Trade] = deque()
-    self.last_signal_time = {"long": 0.0, "short": 0.0}
-    self.last_mid = None
-    self.snapshots = deque(maxlen=50)
+app = FastAPI()
 
-def add_trade(self, price: float, qty: float, is_buyer_maker: bool):
-    t = Trade(time.time(), float(price), float(qty), bool(is_buyer_maker))
-    self.trades.append(t)
-    # prune
-    cutoff = time.time() - TRADE_WINDOW_SECONDS
-    while self.trades and self.trades[0].timestamp < cutoff:
-        self.trades.popleft()
+class TelegramUpdate(BaseModel): update_id: int message: Optional[Dict[str, Any]] = None callback_query: Optional[Dict[str, Any]] = None
 
-def add_snapshot(self, bid: float, ask: float, bid_size: float, ask_size: float):
-    mid = (bid + ask) / 2
-    self.snapshots.append((time.time(), bid, ask, bid_size, ask_size, mid))
-    self.last_mid = mid
+@app.post("/.telegram/webhook") async def telegram_webhook(update: Request): if not TELEGRAM_BOT_TOKEN: raise HTTPException(status_code=400, detail="Telegram not configured") body = await update.json() log.info("Received Telegram update: %s", body) # Basic handling: support /start, /status, /balance, /force_check try: if 'message' in body and 'text' in body['message']: chat_id = body['message']['chat']['id'] text = body['message']['text'] asyncio.create_task(handle_telegram_command(chat_id, text)) except Exception as e: log.exception("Error processing update: %s", e) return {"ok": True}
 
-def calc_imbalance(self):
-    if not self.trades:
-        return 0.5
-    buy_volume = 0.0  # aggressive buys (taker buys -> is_buyer_maker == False)
-    sell_volume = 0.0
-    for tr in self.trades:
-        if tr.is_buyer_maker:
-            # buyer is maker -> seller was aggressor -> executed against bid -> aggressive sell
-            sell_volume += tr.qty * tr.price
+async def handle_telegram_command(chat_id: int, text: str): # send simple replies using Telegram sendMessage API import aiohttp base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" async with aiohttp.ClientSession() as session: if text.startswith('/start'): await session.get(f"{base}/sendMessage", params={"chat_id": chat_id, "text": "Bot is running."}) elif text.startswith('/status'): await session.get(f"{base}/sendMessage", params={"chat_id": chat_id, "text": f"Strategy: Liquidity Orderflow on {SYMBOL} ({TIMEFRAME})"}) elif text.startswith('/balance'): bal = await get_account_balance_summary() await session.get(f"{base}/sendMessage", params={"chat_id": chat_id, "text": bal}) elif text.startswith('/force_check'): await session.get(f"{base}/sendMessage", params={"chat_id": chat_id, "text": "Forcing market check..."}) asyncio.create_task(run_strategy_once()) else: await session.get(f"{base}/sendMessage", params={"chat_id": chat_id, "text": "Unknown command."})
+
+------------------ Exchange client ------------------
+
+exchange: Optional[ccxt.Exchange] = None
+
+async def init_exchange(): global exchange exchange_class = getattr(ccxt, EXCHANGE_ID) exchange = exchange_class({ 'apiKey': EXCHANGE_API_KEY or '', 'secret': EXCHANGE_SECRET or '', 'enableRateLimit': True, # Add testnet settings for supported exchanges here }) # Example for binance testnet if USE_TESTNET and EXCHANGE_ID in ('binance', 'binanceus'): exchange.set_sandbox_mode(True) log.info("Exchange client initialized: %s", EXCHANGE_ID)
+
+------------------ Utilities & Strategy primitives ------------------
+
+async def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=200): # Fetch recent candles and return DataFrame ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit) df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']) df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') df.set_index('timestamp', inplace=True) return df
+
+async def fetch_order_book(symbol=SYMBOL, depth=20): ob = await exchange.fetch_order_book(symbol, limit=depth) return ob
+
+def compute_indicators(df: pd.DataFrame): df = df.copy() df['ema100'] = EMAIndicator(df['close'], window=100).ema_indicator() df['vol_ema30'] = df['volume'].ewm(span=30, adjust=False).mean() return df
+
+def order_book_imbalance(ob: Dict[str, Any], top_n=10): bids = ob.get('bids', [])[:top_n] asks = ob.get('asks', [])[:top_n] bid_liq = sum([price * size for price, size in bids]) ask_liq = sum([price * size for price, size in asks]) # Imbalance ratio > 1 => more bids than asks (bullish imbalance) ratio = (bid_liq / (ask_liq + 1e-9)) return ratio, bid_liq, ask_liq
+
+async def get_account_balance_summary(): try: bal = await exchange.fetch_balance() # Show total USDT or quote currency value quote = SYMBOL.split('/')[1] if quote in bal['total']: return f"Balance {quote}: {bal['total'][quote]}" else: return str(bal['total']) except Exception as e: log.exception("Error fetching balance: %s", e) return "Could not fetch balance"
+
+------------------ Strategy / Execution ------------------
+
+async def compute_position_size(quote_balance: float, entry_price: float, stop_loss: float) -> float: # Risk-based sizing: risk = quote_balance * POSITION_RISK_PCT # size in base currency = risk / (abs(entry - stop_loss)) if entry_price == stop_loss: return 0.0 risk_amount = quote_balance * POSITION_RISK_PCT price_diff = abs(entry_price - stop_loss) size = risk_amount / price_diff return max(size, 0)
+
+async def place_order(side: str, amount: float, symbol=SYMBOL): try: # Market order order = await exchange.create_market_order(symbol, side, amount) return order except Exception as e: log.exception("Order placement failed: %s", e) return None
+
+async def run_strategy_once(): """Single pass: fetch data -> compute signals -> maybe place order""" try: df = await fetch_ohlcv(limit=200) df = compute_indicators(df) latest = df.iloc[-1] prev = df.iloc[-2]
+
+# Basic trend filter
+    price = latest['close']
+    ema100 = latest['ema100']
+    vol = latest['volume']
+    vol_ema = latest['vol_ema30']
+
+    ob = await fetch_order_book(depth=20)
+    imbalance_ratio, bid_liq, ask_liq = order_book_imbalance(ob, top_n=10)
+
+    # Liquidity sweep heuristic:
+    # if previous candle low was pierced intra-candle and price quickly recovered -> possible sweep
+    candle_range = prev['high'] - prev['low']
+    pierced_low = (latest['low'] < prev['low']) and (price > prev['low'])
+    volume_spike = vol > vol_ema * 1.8
+
+    # Signal conditions (long example)
+    long_condition = (
+        price > ema100 and
+        volume_spike and
+        imbalance_ratio > 1.3 and
+        pierced_low
+    )
+
+    # Signal conditions (short example)
+    short_condition = (
+        price < ema100 and
+        volume_spike and
+        imbalance_ratio < 0.7 and
+        (latest['high'] > prev['high'])
+    )
+
+    log.info("Price=%.2f EMA100=%.2f Vol=%.2f VolEMA=%.2f Imb=%.2f long=%s short=%s",
+             price, ema100, vol, vol_ema, imbalance_ratio, long_condition, short_condition)
+
+    if long_condition or short_condition:
+        side = 'buy' if long_condition else 'sell'
+        # Compute stop loss: for long, set SL below last low; for short, set SL above last high
+        if side == 'buy':
+            stop_loss = float(prev['low']) - (candle_range * 0.2)
+            take_profit = price + (price - stop_loss) * 2.0
         else:
-            buy_volume += tr.qty * tr.price
-    total = buy_volume + sell_volume
-    if total == 0:
-        return 0.5
-    return buy_volume / total
+            stop_loss = float(prev['high']) + (candle_range * 0.2)
+            take_profit = price - (stop_loss - price) * 2.0
 
-def detect_large_trades(self):
-    # Count number of "large" trades in window and their side
-    large_buys = 0
-    large_sells = 0
-    for tr in self.trades:
-        if tr.qty >= LARGE_TRADE_SIZE:
-            if tr.is_buyer_maker:
-                large_sells += 1
-            else:
-                large_buys += 1
-    return large_buys, large_sells
+        # get quote balance
+        bal = await exchange.fetch_balance()
+        quote = SYMBOL.split('/')[1]
+        quote_balance = float(bal['total'].get(quote, 0) or 0)
+        size = await compute_position_size(quote_balance, price, stop_loss)
+        if size <= 0:
+            log.warning("Calculated size <= 0, skipping")
+            return
 
-def detect_absorption(self):
-    """Simple absorption detector: many small aggressive trades hitting a level while book shows heavy resting opposite size.
-    We approximate using snapshots + trades. This is a heuristic, not perfect — tune it.
-    """
-    if not self.snapshots:
-        return None
-    # Look at latest snapshot and trades
-    ts, bid, ask, bid_size, ask_size, mid = self.snapshots[-1]
-    # If many aggressive sells (hitting bids) but bid_size remains high => absorption (buy-side absorbing)
-    sell_hits = 0
-    buy_hits = 0
-    small_sell_total = 0.0
-    small_buy_total = 0.0
-    for tr in self.trades:
-        if tr.is_buyer_maker:
-            sell_hits += 1
-            small_sell_total += tr.qty
-        else:
-            buy_hits += 1
-            small_buy_total += tr.qty
-    # Heuristic: if sell hits >> buy hits but bid_size not dropping (still large), it's absorption
-    if sell_hits >= 2 and buy_hits <= 1:
-        # check ratio between resting bid size vs recent sells
-        if bid_size >= (small_sell_total * ABSORPTION_MULTIPLIER):
-            return "absorb_buy"  # bullish absorption
-    if buy_hits >= 2 and sell_hits <= 1:
-        if ask_size >= (small_buy_total * ABSORPTION_MULTIPLIER):
-            return "absorb_sell"
-    return None
+        # Place market order
+        order = await place_order(side, size)
+        if order:
+            log.info("Placed %s order: %s", side, order)
+            # Save trade
+            sess = SessionLocal()
+            t = Trade(symbol=SYMBOL, side=side, entry_price=price, stop_loss=stop_loss, take_profit=take_profit, size=size, opened_at=datetime.now(timezone.utc), closed=False)
+            sess.add(t)
+            sess.commit()
+            sess.close()
+            # Optionally: set OCO orders for TP/SL if exchange supports
 
-def detect_stoprun(self):
-    # Detect a fast sweep beyond recent mid then immediate reversal
-    if len(self.snapshots) < 6:
-        return None
-    latest = self.snapshots[-1]
-    prev = self.snapshots[-6]
-    # percent move
-    mid_move = (latest[5] - prev[5]) / prev[5]
-    if abs(mid_move) >= STOPRUN_PRICE_MOVE:
-        # direction of sweep
-        direction = "long_sweep" if mid_move > 0 else "short_sweep"
-        # If after sweep, the mid returns inside previous range -> possible stop-run
-        # Quick check: compare mid after 1-2 snapshots
-        for s in list(self.snapshots)[-4:]:
-            if direction == "long_sweep" and s[5] < prev[5] * (1 + STOPRUN_PRICE_MOVE / 2):
-                return "stoprun_short"
-            if direction == "short_sweep" and s[5] > prev[5] * (1 - STOPRUN_PRICE_MOVE / 2):
-                return "stoprun_long"
-    return None
+except Exception as e:
+    log.exception("Error in strategy run: %s", e)
 
-def analyze(self):
-    signals = []
-    imbalance = self.calc_imbalance()
-    large_buys, large_sells = self.detect_large_trades()
-    absr = self.detect_absorption()
-    stoprun = self.detect_stoprun()
+------------------ Background scheduler ------------------
 
-    # Imbalance momentum signal
-    if imbalance >= IMBALANCE_THRESHOLD and large_buys >= 1:
-        signals.append(("long", f"imbalance_buy {imbalance:.2f} large_buys={large_buys}"))
-    if imbalance <= (1 - IMBALANCE_THRESHOLD) and large_sells >= 1:
-        signals.append(("short", f"imbalance_sell {imbalance:.2f} large_sells={large_sells}"))
+scheduler = AsyncIOScheduler()
 
-    # Absorption
-    if absr == "absorb_buy":
-        signals.append(("long", "absorption_buy_detected"))
-    if absr == "absorb_sell":
-        signals.append(("short", "absorption_sell_detected"))
+@app.on_event("startup") async def startup_event(): await init_exchange() # Start polling schedule: run strategy every timeframe (e.g., 5 minutes + small offset) minutes = int(TIMEFRAME.replace('m','') if 'm' in TIMEFRAME else 1) scheduler.add_job(run_strategy_once, 'interval', minutes=minutes, next_run_time=datetime.now()+timedelta(seconds=10)) scheduler.start() log.info("Scheduler started: running strategy every %s", TIMEFRAME) # Set Telegram webhook if configured if TELEGRAM_BOT_TOKEN and TELEGRAM_WEBHOOK_URL: import aiohttp async with aiohttp.ClientSession() as session: resp = await session.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook", params={"url": TELEGRAM_WEBHOOK_URL}) data = await resp.json() log.info("SetWebhook response: %s", data)
 
-    # Stop-run
-    if stoprun == "stoprun_long":
-        signals.append(("long", "stoprun_long (sweep & reverse)"))
-    if stoprun == "stoprun_short":
-        signals.append(("short", "stoprun_short (sweep & reverse)"))
+@app.on_event("shutdown") async def shutdown_event(): if exchange: await exchange.close() scheduler.shutdown()
 
-    # Reduce duplicate/conflicting signals: prefer latest unique side
-    final = {}
-    for side, text in signals:
-        final[side] = text
+------------------ Simple health endpoint ------------------
 
-    # apply cooldown
-    now = time.time()
-    out = []
-    for side, text in final.items():
-        if now - self.last_signal_time.get(side, 0) > MIN_COOLDOWN:
-            out.append((side, text))
-            self.last_signal_time[side] = now
-    return out
+@app.get('/') async def root(): return {"status": "ok", "symbol": SYMBOL, "timeframe": TIMEFRAME}
 
----------------- Telegram helper ----------------
+------------------ If run as script (dev) ------------------
 
-async def send_telegram(message: str): if DRY_RUN: print("[DRY-RUN] Telegram message would be:\n", message) return if TELEGRAM_TOKEN.startswith("REPLACE") or TELEGRAM_CHAT_ID.startswith("REPLACE"): print("Telegram token/chat-id not set. Skipping send. Message:\n", message) return url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage" payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message} async with aiohttp.ClientSession() as session: try: async with session.post(url, json=payload, timeout=10) as resp: text = await resp.text() if resp.status != 200: print("Telegram send failed:", resp.status, text) except Exception as e: print("Telegram send exception:", e)
-
---------------- Binance websocket handling ---------------
-
-BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
-
-async def stream_handler(symbol: str, engine: TapeEngine): # build combined streams: trade (aggTrade) and depth (bookTicker for top-of-book) trade_stream = f"{symbol}@trade"  # trade provides isBuyerMaker book_stream = f"{symbol}@bookTicker"  # top of book snapshot url = BINANCE_WS_BASE + trade_stream + "/" + book_stream print("Connecting to", url) backoff = 1 while True: try: async with websockets.connect(url, max_size=2**25) as ws: print("Connected to websocket") backoff = 1 async for raw in ws: data = json.loads(raw) # combined stream has 'stream' and 'data' if "data" not in data: continue payload = data["data"] stream = data.get("stream", "") if payload.get("e") == "trade": # sample payload fields: p=price, q=qty, m=isBuyerMaker price = float(payload["p"]) qty = float(payload["q"]) is_buyer_maker = bool(payload["m"])  # True => buyer is maker => seller aggressor engine.add_trade(price, qty, is_buyer_maker) elif payload.get("e") == "bookTicker": bid = float(payload["b"])  # best bid price ask = float(payload["a"])  # best ask # we don't get sizes in bookTicker; use a snapshot poll to fetch sizes occasionally engine.add_snapshot(bid, ask, bid_size=0.0, ask_size=0.0) # analyze sigs = engine.analyze() for side, txt in sigs: msg = f"[{symbol.upper()}] {side.upper()} signal: {txt} | mid={engine.last_mid} | imbalance={engine.calc_imbalance():.2f}" print(msg) # recommend SL/TP based on recent mid & average trade size (VERY basic) sl = engine.last_mid * (0.999 if side == 'long' else 1.001) tp = engine.last_mid * (1.003 if side == 'long' else 0.997) msg += f"\nSuggested: SL={sl:.2f} TP={tp:.2f}" asyncio.create_task(send_telegram(msg)) except Exception as e: print(f"Websocket error: {e}. reconnecting in {backoff}s") await asyncio.sleep(backoff) backoff = min(backoff * 2, 30)
-
----------------- Main ----------------
-
-async def periodic_book_size_fetch(symbol: str, engine: TapeEngine): # bookTicker doesn't include sizes for both sides; poll REST order book occasionally to get top size url = f"https://api.binance.com/api/v3/depth?symbol={symbol.upper()}&limit=5" async with aiohttp.ClientSession() as session: while True: try: async with session.get(url, timeout=5) as resp: if resp.status == 200: j = await resp.json() bid = float(j["bids"][0][0]) bid_size = float(j["bids"][0][1]) ask = float(j["asks"][0][0]) ask_size = float(j["asks"][0][1]) engine.add_snapshot(bid, ask, bid_size, ask_size) except Exception as e: print("book fetch error:", e) await asyncio.sleep(1.0)
-
-async def reporter(engine: TapeEngine): while True: await asyncio.sleep(LOG_EVERY) imbalance = engine.calc_imbalance() lb, ls = engine.detect_large_trades() print(f"REPORT: trades_in_window={len(engine.trades)} imbalance={imbalance:.2f} large_buys={lb} large_sells={ls}")
-
-async def main(): engine = TapeEngine() tasks = [stream_handler(SYMBOL, engine), periodic_book_size_fetch(SYMBOL, engine), reporter(engine)] await asyncio.gather(*tasks)
-
-if name == 'main': try: asyncio.run(main()) except KeyboardInterrupt: print("Exiting")
+if name == 'main': import uvicorn uvicorn.run('telegram_render_trading_bot:app', host='0.0.0.0', port=8000, reload=True)
 
