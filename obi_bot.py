@@ -10,13 +10,29 @@ import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = Flask(__name__)  # Flask instance named 'app' for gunicorn
 
 # Environment variables
 TOKEN = os.environ['TELEGRAM_TOKEN']
-WEBHOOK_URL = os.environ['WEBHOOK_URL']
+WEBHOOK_URL = os.environ['WEBHOOK_URL']  # e.g., https://obi-bot.onrender.com (no /webhook)
 bot = telebot.TeleBot(TOKEN)
+
+# Set webhook on startup (runs even under Gunicorn)
+def setup_webhook():
+    try:
+        bot.remove_webhook()
+        full_webhook_url = f"{WEBHOOK_URL}/webhook"
+        response = bot.set_webhook(url=full_webhook_url)
+        if response:
+            logger.info(f"Webhook set successfully to {full_webhook_url}")
+        else:
+            logger.error("Failed to set webhook - empty response")
+    except Exception as e:
+        logger.error(f"Webhook URL error: {e}")
+
+setup_webhook()  # Call immediately
 
 @bot.message_handler(commands=['start'])
 def start_message(message):
@@ -62,12 +78,17 @@ def predict(message):
         )
         bot.send_message(message.chat.id, msg)
     except Exception as e:
-        logging.error(f"Prediction error: {e}")
+        logger.error(f"Prediction error: {e}")
         bot.send_message(message.chat.id, f"Error generating prediction: {str(e)}")
 
 @app.route('/', methods=['GET'])
 def index():
     return "AI Trading Bot is running! Check logs for details."
+
+@app.route('/setwebhook', methods=['GET'])
+def manual_set_webhook():
+    setup_webhook()
+    return "Webhook setup attempted—check logs!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -80,10 +101,6 @@ def webhook():
         return 'Unauthorized', 403
 
 if __name__ == '__main__':
-    # Set webhook on startup
-    bot.remove_webhook()
-    bot.set_webhook(url=f"{WEBHOOK_URL}/webhook")
-    logging.info(f"Webhook set to {WEBHOOK_URL}/webhook")
-    
+    # Fallback for local runs
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
